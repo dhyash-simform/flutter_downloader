@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -22,6 +23,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.work.Worker
 import androidx.work.WorkerParameters
+import androidx.work.ForegroundInfo
 import io.flutter.FlutterInjector
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.dart.DartExecutor
@@ -185,14 +187,25 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         saveInPublicStorage = inputData.getBoolean(ARG_SAVE_IN_PUBLIC_STORAGE, false)
         primaryId = task.primaryId
         setupNotification(applicationContext)
-        updateNotification(
-            applicationContext,
-            filename ?: url,
-            DownloadStatus.RUNNING,
-            task.progress,
-            null,
-            false
-        )
+
+        // Promote to foreground EARLY regardless of showNotification to keep worker alive if app is swiped from recents.
+        // If user opted out of notifications we still must show a minimal one (Android requirement for foreground service)
+        try {
+            setForegroundAsync(createForegroundInfo(applicationContext, (filename ?: url), task.progress))
+        } catch (e: Exception) {
+            logError("Failed to set foreground: ${e.message}")
+        }
+        // Only show progress notifications if user requested them
+        if (showNotification) {
+            updateNotification(
+                applicationContext,
+                filename ?: url,
+                DownloadStatus.RUNNING,
+                task.progress,
+                null,
+                false
+            )
+        }
         taskDao?.updateTask(id.toString(), DownloadStatus.RUNNING, task.progress)
 
         // automatic resume for partial files. (if the workmanager unexpectedly quited in background)
@@ -209,7 +222,9 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             taskDao = null
             Result.success()
         } catch (e: Exception) {
-            updateNotification(applicationContext, filename ?: url, DownloadStatus.FAILED, -1, null, true)
+            if (showNotification) {
+                updateNotification(applicationContext, filename ?: url, DownloadStatus.FAILED, -1, null, true)
+            }
             taskDao?.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
             e.printStackTrace()
             dbHelper = null
@@ -408,11 +423,6 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                         progress != lastProgress
                     ) {
                         lastProgress = progress
-
-                        // This line possibly causes system overloaded because of accessing to DB too many ?!!!
-                        // but commenting this line causes tasks loaded from DB missing current downloading progress,
-                        // however, this missing data should be temporary and it will be updated as soon as
-                        // a new bunch of data fetched and a notification sent
                         taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
                         updateNotification(
                             context,
@@ -422,6 +432,14 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                             null,
                             false
                         )
+                        // Step 3: refresh ForegroundInfo so system keeps service alive
+                        if (showNotification) {
+                            try {
+                                setForegroundAsync(createForegroundInfo(context, actualFilename ?: url, progress))
+                            } catch (e: Exception) {
+                                logError("Failed to refresh foreground: ${e.message}")
+                            }
+                        }
                     }
                 }
                 val loadedTask = taskDao?.loadTask(id.toString())
@@ -815,6 +833,41 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 val contentResolver = applicationContext.contentResolver
                 contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
             }
+        }
+    }
+
+    private fun createForegroundInfo(context: Context, title: String?, progress: Int): ForegroundInfo {
+        // Build a notification similar to updateNotification for initial foreground promotion
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setContentTitle(title)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setAutoCancel(false)
+
+        if (progress <= 0) {
+            builder.setContentText(msgStarted)
+                .setProgress(0, 0, false)
+                .setSmallIcon(notificationIconRes)
+        } else if (progress < 100) {
+            builder.setContentText(msgInProgress)
+                .setProgress(100, progress, false)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+        } else {
+            builder.setContentText(msgComplete)
+                .setProgress(0, 0, false)
+                .setOngoing(false)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+        }
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Specify service type DATA_SYNC so OS treats it as long running data transfer
+            ForegroundInfo(
+                primaryId,
+                builder.build(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            ForegroundInfo(primaryId, builder.build())
         }
     }
 
