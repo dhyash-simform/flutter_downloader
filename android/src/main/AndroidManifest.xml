@@ -1,4 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  xmlns:tools="http://schemas.android.com/tools"
   package="vn.hunghd.flutterdownloader">
 
     <!-- See https://developer.android.com/training/package-visibility -->
@@ -8,5 +9,9 @@
         </intent>
     </queries>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Allow keeping download worker alive via a foreground service (added in API 28, safely ignored on older devices) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Type-specific permission for data sync / download style work on Android 14+ (ignored pre-34) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" tools:targetApi="34" />
 
 </manifest>
