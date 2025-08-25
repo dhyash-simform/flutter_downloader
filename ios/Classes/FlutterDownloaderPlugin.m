@@ -95,9 +95,9 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             NSLog(@"database path: %@", dbPath);
         }
         // Use a serial queue with an explicit QoS to avoid priority inversion when called from UI / Flutter threads.
-        databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", DISPATCH_QUEUE_SERIAL);
-        dispatch_set_qos_class(databaseQueue, QOS_CLASS_UTILITY, 0);
-        
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+        databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", attr);
+
         _dbManager = [[FlutterDownloaderDBManager alloc] initWithDatabaseFilePath:dbPath];
         
         if (_runningTaskById == nil) {
