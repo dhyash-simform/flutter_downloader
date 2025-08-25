@@ -38,6 +38,8 @@
     FlutterDownloaderDBManager *_dbManager;
     NSString *_allFilesDownloadedMsg;
     NSMutableArray *_eventQueue;
+    // Added: metrics store
+    NSMutableDictionary *_progressMetrics; // taskId -> @{ bytes:@(totalBytesWritten), time: NSDate }
 }
 
 @property(nonatomic, strong) dispatch_queue_t databaseQueue;
@@ -99,6 +101,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         if (_runningTaskById == nil) {
             _runningTaskById = [[NSMutableDictionary alloc] init];
         }
+        _progressMetrics = [[NSMutableDictionary alloc] init];
 
         NSBundle *mainBundle = [NSBundle mainBundle];
 
@@ -133,6 +136,48 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     return self;
 }
 
+// Added: helper to log free disk space
+- (void)fd_logDiskSpaceWithPrefix:(NSString*)prefix {
+    if (!debug) return;
+    NSError *error = nil;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfFileSystemForPath:NSHomeDirectory() error:&error];
+    if (error) {
+        NSLog(@"[FD][Disk][%@] Error getting FS attributes: %@", prefix, error);
+        return;
+    }
+    unsigned long long free = [attrs[NSFileSystemFreeSize] unsignedLongLongValue];
+    unsigned long long total = [attrs[NSFileSystemSize] unsignedLongLongValue];
+    NSLog(@"[FD][Disk][%@] free=%lluMB total=%lluMB", prefix, free/1024/1024, total/1024/1024);
+}
+
+// Added: ensure saved dir exists & writable
+- (BOOL)fd_ensureDirectoryExists:(NSString*)absoluteDir error:(NSError**)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    BOOL exists = [fm fileExistsAtPath:absoluteDir isDirectory:&isDir];
+    if (exists && !isDir) {
+        if (debug) NSLog(@"[FD][Dir] Path exists but not directory: %@", absoluteDir);
+        return NO;
+    }
+    if (!exists) {
+        if (debug) NSLog(@"[FD][Dir] Creating directory: %@", absoluteDir);
+        if (![fm createDirectoryAtPath:absoluteDir withIntermediateDirectories:YES attributes:nil error:error]) {
+            if (debug) NSLog(@"[FD][Dir] Failed to create directory %@ error=%@", absoluteDir, *error);
+            return NO;
+        }
+    }
+    // Write test (optional lightweight)
+    NSString *testFile = [absoluteDir stringByAppendingPathComponent:@".__fd_write_test__"];
+    NSData *probe = [@"fd" dataUsingEncoding:NSUTF8StringEncoding];
+    if (![probe writeToFile:testFile atomically:YES]) {
+        if (debug) NSLog(@"[FD][Dir] Cannot write test file into %@", absoluteDir);
+        return NO;
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:testFile error:nil];
+    if (debug) NSLog(@"[FD][Dir] Directory ready: %@", absoluteDir);
+    return YES;
+}
+
 - (void)startBackgroundIsolate:(int64_t)handle {
     if (debug) {
         NSLog(@"startBackgroundIsolate");
@@ -162,6 +207,9 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 
 - (NSURLSessionDownloadTask*)downloadTaskWithURL: (NSURL*) url fileName: (NSString*) fileName andSavedDir: (NSString*) savedDir andHeaders: (NSString*) headers
 {
+    if (debug) {
+        NSLog(@"[FD][CreateTask] URL=%@ fileName=%@ savedDir(short)=%@ headers=%@", url, fileName, savedDir, headers);
+    }
     NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:url];
     if (headers != nil && [headers length] > 0) {
         NSError *jsonError;
@@ -180,6 +228,10 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     // store task id in taskDescription
     task.taskDescription = [self createTaskId];
     [task resume];
+
+    if (debug) {
+        NSLog(@"[FD][CreateTask] Created taskId=%@ state=%ld", task.taskDescription, (long)task.state);
+    }
 
     return task;
 }
@@ -365,7 +417,15 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
          [weakSelf updateTask:taskId filename:filename];
      }];
 
-     return [self fileUrlFromDict:mutableTaskInfo];
+     if (debug) {
+         NSLog(@"[FD][FileName] Final filename for task %@ => %@ (suggested=%@)", taskId, filename, suggestedFilename);
+     }
+
+     NSURL *fileURL = [self fileUrlFromDict:mutableTaskInfo];
+     if (debug) {
+         NSLog(@"[FD][FilePath] Destination path for task %@ => %@", taskId, fileURL);
+     }
+     return fileURL;
 }
 
 - (NSString *)sanitizeFilename:(nullable NSString *)filename {
@@ -560,7 +620,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     
     NSArray *values = @[@(resumable ? 1 : 0), taskId];
     
-    [_dbManager executeQuery:query withParameters:values];
+    [_dbManager.executeQuery:query withParameters:values];
     
     if (debug) {
         NSLog(@"Update \n%@\n\n%@",taskId,query);
@@ -715,6 +775,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (void)enqueueMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    if (debug) NSLog(@"[FD][API] enqueue called with args=%@", call.arguments);
     NSString *urlString = call.arguments[KEY_URL];
     NSString *savedDir = call.arguments[KEY_SAVED_DIR];
     NSString *shortSavedDir = [self shortenSavedDirPath:savedDir];
@@ -722,7 +783,20 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     NSString *headers = call.arguments[KEY_HEADERS];
     NSNumber *showNotification = call.arguments[KEY_SHOW_NOTIFICATION];
     NSNumber *openFileFromNotification = call.arguments[KEY_OPEN_FILE_FROM_NOTIFICATION];
-    
+
+    // Validate URL
+    if (debug && ![NSURL URLWithString:urlString]) {
+        NSLog(@"[FD][API] Invalid URL string: %@", urlString);
+    }
+
+    // Ensure directory
+    NSError *dirErr = nil;
+    BOOL dirOK = [self fd_ensureDirectoryExists:savedDir error:&dirErr];
+    if (!dirOK) {
+        if (debug) NSLog(@"[FD][API] Directory problem for %@ error=%@", savedDir, dirErr);
+    }
+    [self fd_logDiskSpaceWithPrefix:@"enqueue_before_start"];
+
     NSURLSessionDownloadTask *task = [self downloadTaskWithURL:[NSURL URLWithString:urlString] fileName:fileName andSavedDir:savedDir andHeaders:headers];
     
     NSString *taskId = [self identifierForTask:task];
@@ -746,6 +820,8 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     }];
     result(taskId);
     [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_ENQUEUED) andProgress:@0];
+
+    if (debug) NSLog(@"[FD][API] Enqueued taskId=%@", taskId);
 }
 
 - (void)loadTasksMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
@@ -783,6 +859,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (void)resumeMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    if (debug) NSLog(@"[FD][API] resume called with args=%@", call.arguments);
     NSString *taskId = call.arguments[KEY_TASK_ID];
     NSDictionary* taskDict = [self loadTaskWithId:taskId];
     if (taskDict != nil) {
@@ -792,6 +869,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 
             if (debug) {
                 NSLog(@"Try to load resume data at url: %@", partialFileURL);
+                NSLog(@"[FD][Resume] Resume data size=%lu bytes", (unsigned long)resumeData.length);
             }
 
             NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
@@ -818,6 +896,8 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
                     NSNumber *progress = task[KEY_PROGRESS];
                     [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:progress];
                 }];
+
+                if (debug) NSLog(@"[FD][Resume] New taskId=%@ replacing old=%@", newTaskId, taskId);
             } else {
                 result([FlutterError errorWithCode:@"invalid_data"
                                            message:@"not found resume data, this task cannot be resumed"
@@ -834,6 +914,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (void)retryMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    if (debug) NSLog(@"[FD][API] retry called with args=%@", call.arguments);
     NSString *taskId = call.arguments[KEY_TASK_ID];
     NSDictionary* taskDict = [self loadTaskWithId:taskId];
     if (taskDict != nil) {
@@ -861,6 +942,8 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             }];
             result(newTaskId);
             [self sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_ENQUEUED) andProgress:@(0)];
+
+            if (debug) NSLog(@"[FD][Retry] newTaskId=%@ from old=%@", newTaskId, taskId);
         } else {
             result([FlutterError errorWithCode:@"invalid_status"
                                        message:@"only failed and canceled task can be retried"
@@ -892,6 +975,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (void)removeMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    if (debug) NSLog(@"[FD][API] remove called with args=%@", call.arguments);
     __typeof__(self) __weak weakSelf = self;
 
     NSString *taskId = call.arguments[KEY_TASK_ID];
@@ -994,6 +1078,30 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 # pragma mark - NSURLSessionTaskDelegate
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
+    // Added detailed progress + speed logging
+    NSString *taskId = [self identifierForTask:downloadTask];
+    NSDate *now = [NSDate date];
+    NSMutableDictionary *metric = _progressMetrics[taskId];
+    if (!metric) {
+        metric = [@{ @"bytes": @(0), @"time": now } mutableCopy];
+        _progressMetrics[taskId] = metric;
+    }
+    int64_t prevBytes = [metric[@"bytes"] longLongValue];
+    NSDate *prevTime = metric[@"time"];
+    metric[@"bytes"] = @(totalBytesWritten);
+    metric[@"time"] = now;
+    double speedKBs = 0.0;
+    if (prevTime) {
+        NSTimeInterval dt = [now timeIntervalSinceDate:prevTime];
+        int64_t delta = totalBytesWritten - prevBytes;
+        if (dt > 0 && delta >= 0) {
+            speedKBs = (double)delta / 1024.0 / dt;
+        }
+    }
+    if (debug) {
+        NSLog(@"[FD][Progress] task=%@ bytes=%lld/%lld (%.2f%%) chunk=%lld speed=%.2fKB/s state=%ld thread=%@", taskId, totalBytesWritten, totalBytesExpectedToWrite, totalBytesExpectedToWrite>0? (totalBytesWritten*100.0/totalBytesExpectedToWrite):0.0, bytesWritten, speedKBs, (long)downloadTask.state, [NSThread isMainThread]?@"main":@"bg");
+    }
+
     if (totalBytesExpectedToWrite == NSURLSessionTransferSizeUnknown) {
         if (debug) {
             NSLog(@"Unknown transfer size");
@@ -1059,6 +1167,11 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         
         __typeof__(self) __weak weakSelf = self;
         if (success) {
+            if (debug) {
+                NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:[destinationURL path] error:nil];
+                unsigned long long fsize = [attrs fileSize];
+                NSLog(@"[FD][Finish] Copied file to %@ size=%llu bytes", destinationURL, fsize);
+            }
             [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_COMPLETE) andProgress:@100];
             [self executeInDatabaseQueueForTask:^{
                 [weakSelf updateTask:taskId status:STATUS_COMPLETE progress:100];
@@ -1113,7 +1226,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 -(void)URLSessionDidFinishEventsForBackgroundURLSession:(NSURLSession *)session
 {
     if (debug) {
-        NSLog(@"URLSessionDidFinishEventsForBackgroundURLSession:");
+        NSLog(@"[FD][BG] URLSessionDidFinishEventsForBackgroundURLSession id=%@", session.configuration.identifier);
     }
     // Check if all download tasks have been finished.
     [[self currentSession] getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {

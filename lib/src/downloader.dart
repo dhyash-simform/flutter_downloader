@@ -14,11 +14,7 @@ import 'models.dart';
 
 /// Signature for a function which is called when the download state of a task
 /// with [id] changes.
-typedef DownloadCallback = void Function(
-  String id,
-  int status,
-  int progress,
-);
+typedef DownloadCallback = void Function(String id, int status, int progress);
 
 /// Provides access to all functions of the plugin in a single place.
 class FlutterDownloader {
@@ -150,22 +146,20 @@ class FlutterDownloader {
         );
       }
 
-      return result.map(
-        (dynamic item) {
-          return DownloadTask(
-            taskId: item['task_id'] as String,
-            status: DownloadTaskStatus.fromInt(item['status'] as int),
-            progress: item['progress'] as int,
-            url: item['url'] as String,
-            filename: item['file_name'] as String?,
-            savedDir: item['saved_dir'] as String,
-            timeCreated: item['time_created'] as int,
+      return result.map((dynamic item) {
+        return DownloadTask(
+          taskId: item['task_id'] as String,
+          status: DownloadTaskStatus.fromInt(item['status'] as int),
+          progress: item['progress'] as int,
+          url: item['url'] as String,
+          filename: item['file_name'] as String?,
+          savedDir: item['saved_dir'] as String,
+          timeCreated: item['time_created'] as int,
 
-            // allowCellular field is true by default (similar to enqueue())
-            allowCellular: (item['allow_cellular'] as bool?) ?? true,
-          );
-        },
-      ).toList();
+          // allowCellular field is true by default (similar to enqueue())
+          allowCellular: (item['allow_cellular'] as bool?) ?? true,
+        );
+      }).toList();
     } on FlutterDownloaderException catch (err) {
       _log('Failed to load tasks. Reason: ${err.message}');
     } on PlatformException catch (err) {
@@ -208,22 +202,20 @@ class FlutterDownloader {
         );
       }
 
-      return result.map(
-        (dynamic item) {
-          return DownloadTask(
-            taskId: item['task_id'] as String,
-            status: DownloadTaskStatus.fromInt(item['status'] as int),
-            progress: item['progress'] as int,
-            url: item['url'] as String,
-            filename: item['file_name'] as String?,
-            savedDir: item['saved_dir'] as String,
-            timeCreated: item['time_created'] as int,
+      return result.map((dynamic item) {
+        return DownloadTask(
+          taskId: item['task_id'] as String,
+          status: DownloadTaskStatus.fromInt(item['status'] as int),
+          progress: item['progress'] as int,
+          url: item['url'] as String,
+          filename: item['file_name'] as String?,
+          savedDir: item['saved_dir'] as String,
+          timeCreated: item['time_created'] as int,
 
-            // allowCellular field is true by default (similar to enqueue())
-            allowCellular: (item['allow_cellular'] as bool?) ?? true,
-          );
-        },
-      ).toList();
+          // allowCellular field is true by default (similar to enqueue())
+          allowCellular: (item['allow_cellular'] as bool?) ?? true,
+        );
+      }).toList();
     } on PlatformException catch (err) {
       _log('Failed to loadTasksWithRawQuery. Reason: ${err.message}');
       return null;
@@ -355,10 +347,7 @@ class FlutterDownloader {
 
     bool? result;
     try {
-      result = await _channel.invokeMethod<bool>(
-        'open',
-        {'task_id': taskId},
-      );
+      result = await _channel.invokeMethod<bool>('open', {'task_id': taskId});
 
       if (result == null) {
         throw const FlutterDownloaderException(message: '`open` returned null');
@@ -430,10 +419,10 @@ class FlutterDownloader {
       'step size is not in the inclusive <0;100> range',
     );
 
-    await _channel.invokeMethod<void>(
-      'registerCallback',
-      <dynamic>[callbackHandle!.toRawHandle(), step],
-    );
+    await _channel.invokeMethod<void>('registerCallback', <dynamic>[
+      callbackHandle!.toRawHandle(),
+      step,
+    ]);
   }
 
   /// Prints [message] to console if [_debug] is true.
