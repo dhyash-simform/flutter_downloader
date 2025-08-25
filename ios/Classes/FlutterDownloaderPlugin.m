@@ -360,6 +360,9 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     // Execute asynchronously to avoid blocking higher QoS (UI) threads and eliminate priority inversion warnings.
     dispatch_async(databaseQueue, ^{
         if (weakSelf.isDatabaseQueueTerminated) return;
+        if (debug && [NSThread isMainThread]) {
+            NSLog(@"[FD][Warn] Database block executing on main thread unexpectedly");
+        }
         task();
     });
 }
@@ -624,7 +627,8 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     
     NSArray *values = @[@(resumable ? 1 : 0), taskId];
     
-    [_dbManager.executeQuery:query withParameters:values];
+    // FIX: incorrect dot-syntax invocation
+    [_dbManager executeQuery:query withParameters:values];
     
     if (debug) {
         NSLog(@"Update \n%@\n\n%@",taskId,query);
@@ -870,13 +874,11 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         NSNumber* status = taskDict[KEY_STATUS];
         if ([status intValue] == STATUS_PAUSED) {
             NSURL *partialFileURL = [self fileUrlFromDict:taskDict];
-
+            NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL]; // moved before logging
             if (debug) {
                 NSLog(@"Try to load resume data at url: %@", partialFileURL);
                 NSLog(@"[FD][Resume] Resume data size=%lu bytes", (unsigned long)resumeData.length);
             }
-
-            NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
 
             if (resumeData != nil) {
                 NSURLSessionDownloadTask *task = [[self currentSession] downloadTaskWithResumeData:resumeData];
