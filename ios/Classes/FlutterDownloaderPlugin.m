@@ -43,6 +43,7 @@
 }
 
 @property(nonatomic, strong) dispatch_queue_t databaseQueue;
+@property(nonatomic, strong) dispatch_semaphore_t databaseLock;
 
 /// The flag ensures that the database task avoids be marked as other status after be marked as canceled in the termination.
 @property(nonatomic, assign, getter=isDatabaseQueueTerminated) BOOL databaseQueueTerminated;
@@ -61,6 +62,7 @@ static int _step = 10;
 static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = nil;
 
 @synthesize databaseQueue;
+@synthesize databaseLock;
 
 - (instancetype)init:(NSObject<FlutterPluginRegistrar> *)registrar;
 {
@@ -96,6 +98,8 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         }
         // Use a serial queue with an explicit QoS to avoid priority inversion when called from UI / Flutter threads.
         databaseQueue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+        databaseLock = dispatch_semaphore_create(1); // enforce serial access
+
 
         _dbManager = [[FlutterDownloaderDBManager alloc] initWithDatabaseFilePath:dbPath];
         
@@ -354,15 +358,16 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (void)executeInDatabaseQueueForTask:(void (^)(void))task {
-    __typeof__(self) __weak weakSelf = self;
     if (!task) return;
-    // Execute asynchronously to avoid blocking higher QoS (UI) threads and eliminate priority inversion warnings.
+    __typeof__(self) __weak weakSelf = self;
+
     dispatch_async(databaseQueue, ^{
         if (weakSelf.isDatabaseQueueTerminated) return;
-        if (debug && [NSThread isMainThread]) {
-            NSLog(@"[FD][Warn] Database block executing on main thread unexpectedly");
-        }
+
+        // serialize DB access
+        dispatch_semaphore_wait(weakSelf.databaseLock, DISPATCH_TIME_FOREVER);
         task();
+        dispatch_semaphore_signal(weakSelf.databaseLock);
     });
 }
 
